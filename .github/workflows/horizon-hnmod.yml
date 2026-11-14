@@ -1,0 +1,68 @@
+# Builds the Horizon port (horizon/) into take_your_stream_chat-<version>.hnmod: tests its logic, packages the
+# source-only archive Horizon's launcher takes, checks it with the registry's own checker and uploads it.
+# Publish a GitHub release and the file is attached to it.
+name: horizon-hnmod
+on:
+  push:
+    branches: [main]
+    paths: ["horizon/**", "LICENSE", ".github/workflows/horizon-hnmod.yml"]
+  pull_request:
+    paths: ["horizon/**", "LICENSE", ".github/workflows/horizon-hnmod.yml"]
+  release:
+    types: [published]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: horizon-hnmod-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+env:
+  # The Rust the Horizon launcher builds native mods with; the mod itself is edition 2024.
+  RUST: "1.99.1"
+jobs:
+  hnmod:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # only used to attach the file to a release
+    defaults:
+      run:
+        working-directory: horizon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Rust
+        run: rustup toolchain install "$RUST" --profile minimal && rustup default "$RUST"
+      - name: Unit tests
+        run: cargo test
+      - name: Package the .hnmod
+        run: python3 tools/package.py | tee target/package.json
+      - name: Install the registry's checker
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-binstall
+      - name: Check the .hnmod with Horizon's own checks
+        run: |
+          # The checker is built from the Horizon repository: a prebuilt binary when there is one.
+          cargo binstall --git https://github.com/horizon-rust/horizon cargo-horizon-mod --no-confirm \
+            || cargo install --git https://github.com/horizon-rust/horizon cargo-horizon-mod --locked
+          cargo horizon-mod check target/*.hnmod
+      - name: Summary
+        run: |
+          {
+            echo "### .hnmod built"
+            echo '```json'
+            jq '{file: (.file | split("/") | last), size, sha256}' target/package.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: take_your_stream_chat-hnmod
+          path: horizon/target/*.hnmod
+          if-no-files-found: error
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" target/*.hnmod --clobber --repo "${{ github.repository }}"

@@ -2,7 +2,7 @@
 name = "horizon-mod-take-your-stream-chat"
 version = "0.2.0"
 edition = "2024"
-license = "MIT"
+license = "CC0-1.0"
 publish = false
 description = "Take Your Stream Chat for Horizon, a native mod: live Twitch and TikTok chat on the HUD and floating in the world."
 

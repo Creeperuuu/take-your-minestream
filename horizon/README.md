@@ -40,6 +40,18 @@ signature mismatches on the first `native-build`.
 - Twitch is read over plain IRC (port 6667, no TLS) because native mods here have only `std`. Nothing
   private is sent: the connection is anonymous and read-only.
 
+## Build the .hnmod
+
+The `horizon-hnmod` workflow (`.github/workflows/horizon-hnmod.yml`) builds `take_your_stream_chat-<version>.hnmod`
+on every push or pull request that touches `horizon/`, and on request from the Actions tab (Run workflow). It runs
+the unit tests, packages the archive, checks it with `cargo horizon-mod check` (the registry's own checks) and
+uploads it as the `take_your_stream_chat-hnmod` artifact of the run. Publish a GitHub release and the file is
+attached to it.
+
+To build it yourself (Python 3.12+, nothing else): `python3 horizon/tools/package.py` writes
+`horizon/target/take_your_stream_chat-<version>.hnmod`. The package is source only; Horizon's launcher compiles it
+on the pinned Horizon revision. Raise `version` in `horizon-mixin.toml` for a new release.
+
 ## Install
 
 Build it into the game with the launcher (see Horizon's
