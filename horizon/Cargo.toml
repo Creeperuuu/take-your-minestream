@@ -1,10 +1,10 @@
 [package]
 name = "horizon-mod-take-your-stream-chat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 publish = false
-description = "Take Your Stream Chat for Horizon, a native mod: live Twitch chat on the HUD and floating in the world."
+description = "Take Your Stream Chat for Horizon, a native mod: live Twitch and TikTok chat on the HUD and floating in the world."
 
 # The mod's logic and its tests: the same file the bundle adds to the game.
 [lib]

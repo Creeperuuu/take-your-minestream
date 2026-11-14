@@ -1,6 +1,6 @@
 [mod]
 id = "take_your_stream_chat"
-version = "0.1.0"
+version = "0.2.0"
 priority = 100
 
 # The commit it was written against. It uses only native hook points
@@ -13,6 +13,13 @@ id = "runtime"
 file = "crates/horizon-client/src/game.rs"
 name = "take_your_stream_chat"
 source = "runtime.rs"
+
+# The HTTPS and gzip of the TikTok reader, a sibling of the module above.
+[[module]]
+id = "tiktok_net"
+file = "crates/horizon-client/src/game.rs"
+name = "take_your_stream_chat_net"
+source = "tiktok_net.rs"
 
 [[injection]]
 id = "hud"

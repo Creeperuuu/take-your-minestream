@@ -1,10 +1,11 @@
-// Take Your Stream Chat for Horizon: live Twitch chat on the HUD and floating in the
-// world. This file is both the mod's Cargo library (its tests) and the module the
-// bundle adds to the game, so it uses only `std`.
+// Take Your Stream Chat for Horizon: live Twitch and TikTok chat on the HUD and floating
+// in the world. This file is both the mod's Cargo library (its tests) and the module the
+// bundle adds to the game, so it uses only `std`; HTTPS and gzip live in `tiktok_net.rs`.
 //
 // Twitch is read anonymously (a `justinfan` nick, no token) over plain IRC on port 6667.
+// TikTok is read by polling its web `im/fetch` endpoint, as the original mod's bootstrap does.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::TcpStream;
 use std::sync::Mutex;
@@ -14,8 +15,8 @@ use std::time::{Duration, Instant};
 /// The mod's id (its settings folder), name and version.
 pub const ID: &str = "take_your_stream_chat";
 pub const NAME: &str = "Take Your Stream Chat";
-pub const VERSION: &str = "0.1.0";
-pub const DESCRIPTION: &str = "Live Twitch chat on your HUD and floating in the world. /streamchat chat start, /streamchat channel <name>.";
+pub const VERSION: &str = "0.2.0";
+pub const DESCRIPTION: &str = "Live Twitch and TikTok chat on your HUD and floating in the world. /streamchat channel <name>, /streamchat tiktok <name>, /streamchat chat start.";
 
 /// Messages kept, lines of the HUD, and how long each kind of message stays.
 pub const MAX_MESSAGES: usize = 50;
@@ -70,9 +71,80 @@ impl Mode {
     }
 }
 
+/// A chat service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Platform {
+    Twitch,
+    TikTok,
+}
+
+impl Platform {
+    pub const ALL: [Platform; 2] = [Platform::Twitch, Platform::TikTok];
+    pub fn parse(s: &str) -> Option<Platform> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "twitch" => Some(Platform::Twitch),
+            "tiktok" | "tt" => Some(Platform::TikTok),
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Platform::Twitch => "Twitch",
+            Platform::TikTok => "TikTok",
+        }
+    }
+    /// Shown before the user's name, so the services can be told apart; Twitch, the first
+    /// one, has none.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Platform::Twitch => "",
+            Platform::TikTok => "[TT] ",
+        }
+    }
+    fn index(self) -> usize {
+        self as usize
+    }
+    fn link(self) -> &'static Link {
+        match self {
+            Platform::Twitch => &TWITCH,
+            Platform::TikTok => &TIKTOK,
+        }
+    }
+}
+
+/// One platform's connection thread. The count is odd while it should run, even when off;
+/// every start and stop changes it, so a thread ends when it is no longer the current one.
+struct Link(AtomicU64);
+
+impl Link {
+    fn is_on(&self) -> bool {
+        self.0.load(Ordering::SeqCst) % 2 == 1
+    }
+    fn current(&self, epoch: u64) -> bool {
+        self.0.load(Ordering::SeqCst) == epoch
+    }
+    /// A new generation, odd, dropping any earlier connection.
+    fn start(&self) -> u64 {
+        let mut epoch = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+        if epoch % 2 == 0 {
+            epoch = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+        }
+        epoch
+    }
+    fn stop(&self) {
+        if self.is_on() {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+static TWITCH: Link = Link(AtomicU64::new(0));
+static TIKTOK: Link = Link(AtomicU64::new(0));
+
 /// One chat message. `anchor` is where it floats in the world, set when first drawn.
 #[derive(Clone, Debug)]
 pub struct ChatMessage {
+    pub platform: Platform,
     pub user: String,
     pub text: String,
     /// `0xFFRRGGBB`.
@@ -85,8 +157,13 @@ pub struct ChatMessage {
 struct State {
     messages: VecDeque<ChatMessage>,
     mode: Mode,
+    /// The Twitch channel and the TikTok user to read.
     channel: String,
-    status: String,
+    tiktok_user: String,
+    /// TikTok session cookie the player pasted, optional.
+    tiktok_session: String,
+    /// One line per platform, by `Platform::index`.
+    status: [String; 2],
     banwords: Vec<String>,
     blocked: Vec<String>,
     loaded: bool,
@@ -97,16 +174,14 @@ static STATE: Mutex<State> = Mutex::new(State {
     messages: VecDeque::new(),
     mode: Mode::Both,
     channel: String::new(),
-    status: String::new(),
+    tiktok_user: String::new(),
+    tiktok_session: String::new(),
+    status: [String::new(), String::new()],
     banwords: Vec::new(),
     blocked: Vec::new(),
     loaded: false,
     seq: 0,
 });
-
-/// Bumped by every connect and disconnect: a connection thread ends when it is no longer
-/// the current one.
-static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn state() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
@@ -138,6 +213,10 @@ pub fn ensure_loaded(get: impl Fn(&str) -> Option<String>) {
     if let Some(channel) = get("channel").as_deref().and_then(clean_channel) {
         s.channel = channel;
     }
+    if let Some(user) = get("tiktok_user").as_deref().and_then(clean_tiktok_user) {
+        s.tiktok_user = user;
+    }
+    s.tiktok_session = get("tiktok_session").map(|v| clean_cookie(&v)).unwrap_or_default();
     s.banwords = split_list(get("banwords"));
     s.blocked = split_list(get("blocked"));
 }
@@ -150,33 +229,58 @@ pub fn channel() -> String {
     state().channel.clone()
 }
 
-pub fn is_connected() -> bool {
-    GENERATION.load(Ordering::SeqCst) % 2 == 1
+pub fn tiktok_user() -> String {
+    state().tiktok_user.clone()
 }
 
-pub fn status() -> String {
-    state().status.clone()
+/// The name a platform reads, empty when none is set.
+pub fn target(p: Platform) -> String {
+    match p {
+        Platform::Twitch => channel(),
+        Platform::TikTok => tiktok_user(),
+    }
 }
 
-fn set_status(gen: u64, text: &str) {
-    if GENERATION.load(Ordering::SeqCst) == gen {
-        state().status = text.to_string();
+pub fn is_connected(p: Platform) -> bool {
+    p.link().is_on()
+}
+
+pub fn status(p: Platform) -> String {
+    state().status[p.index()].clone()
+}
+
+fn set_status(p: Platform, epoch: u64, text: &str) {
+    if p.link().current(epoch) {
+        state().status[p.index()] = text.to_string();
     }
 }
 
 /// A channel name as Twitch has them: letters, digits and `_`, up to 25.
 pub fn clean_channel(raw: &str) -> Option<String> {
-    let name: String = raw
-        .trim()
-        .trim_start_matches('#')
-        .to_ascii_lowercase();
+    let name: String = raw.trim().trim_start_matches('#').to_ascii_lowercase();
     let ok = !name.is_empty()
         && name.len() <= 25
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     ok.then_some(name)
 }
 
-// ---------------------------------------------------------------- IRC
+/// A TikTok `@name`: letters, digits, `_` and `.`, up to 24.
+pub fn clean_tiktok_user(raw: &str) -> Option<String> {
+    let name: String = raw.trim().trim_start_matches('@').to_ascii_lowercase();
+    let ok = !name.is_empty()
+        && name.len() <= 24
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+    ok.then_some(name)
+}
+
+/// A pasted cookie without line breaks or other control characters.
+pub fn clean_cookie(raw: &str) -> String {
+    raw.chars().filter(|c| !c.is_control()).collect::<String>().trim().to_string()
+}
+
+// ---------------------------------------------------------------- IRC (Twitch)
 
 fn unescape_tag(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
@@ -257,43 +361,62 @@ pub fn parse_privmsg(line: &str) -> Option<(String, String, u32)> {
     Some((user, text, color))
 }
 
-/// Connects to `channel`'s chat on a background thread, dropping any earlier connection.
-pub fn connect(channel: &str) {
-    // Odd generation = connected, even = off.
-    let mut gen = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    if gen % 2 == 0 {
-        gen = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+/// Starts reading `p`'s chat on a background thread, dropping any earlier connection.
+/// False when no name is set for it.
+pub fn connect(p: Platform) -> bool {
+    let name = target(p);
+    if name.is_empty() {
+        return false;
     }
-    let channel = channel.to_string();
-    state().status = format!("Connecting to #{channel}...");
-    std::thread::spawn(move || run_connection(&channel, gen));
-}
-
-/// Ends the connection.
-pub fn disconnect() {
-    let gen = GENERATION.load(Ordering::SeqCst);
-    if gen % 2 == 1 {
-        GENERATION.fetch_add(1, Ordering::SeqCst);
-    }
-    state().status = "Disconnected".to_string();
-}
-
-fn run_connection(channel: &str, gen: u64) {
-    while GENERATION.load(Ordering::SeqCst) == gen {
-        match read_chat(channel, gen) {
-            Ok(()) => set_status(gen, "Connection closed, retrying..."),
-            Err(e) => set_status(gen, &format!("Connection failed ({e}), retrying...")),
+    let epoch = p.link().start();
+    state().status[p.index()] = format!("Connecting to {}...", name);
+    match p {
+        Platform::Twitch => {
+            std::thread::spawn(move || run_twitch(&name, epoch));
         }
-        for _ in 0..10 {
-            if GENERATION.load(Ordering::SeqCst) != gen {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(500));
+        Platform::TikTok => {
+            let session = state().tiktok_session.clone();
+            std::thread::spawn(move || run_tiktok(&name, &session, epoch));
         }
     }
+    true
 }
 
-fn read_chat(channel: &str, gen: u64) -> std::io::Result<()> {
+/// Ends `p`'s connection.
+pub fn disconnect(p: Platform) {
+    p.link().stop();
+    state().status[p.index()] = "Disconnected".to_string();
+}
+
+/// Sleeps up to `ms`, in short steps; false when `p`'s connection was replaced or ended.
+fn pause(p: Platform, epoch: u64, ms: u64) -> bool {
+    let mut left = ms;
+    while left > 0 {
+        if !p.link().current(epoch) {
+            return false;
+        }
+        let step = left.min(250);
+        std::thread::sleep(Duration::from_millis(step));
+        left -= step;
+    }
+    p.link().current(epoch)
+}
+
+fn run_twitch(channel: &str, epoch: u64) {
+    let p = Platform::Twitch;
+    while p.link().current(epoch) {
+        match read_twitch(channel, epoch) {
+            Ok(()) => set_status(p, epoch, "Connection closed, retrying..."),
+            Err(e) => set_status(p, epoch, &format!("Connection failed ({e}), retrying...")),
+        }
+        if !pause(p, epoch, 5000) {
+            return;
+        }
+    }
+}
+
+fn read_twitch(channel: &str, epoch: u64) -> std::io::Result<()> {
+    let p = Platform::Twitch;
     let mut stream = TcpStream::connect((IRC_HOST, IRC_PORT))?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     let nick = format!(
@@ -306,8 +429,8 @@ fn read_chat(channel: &str, gen: u64) -> std::io::Result<()> {
     )?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
-    set_status(gen, &format!("Connected to #{channel}"));
-    while GENERATION.load(Ordering::SeqCst) == gen {
+    set_status(p, epoch, &format!("Connected to #{channel}"));
+    while p.link().current(epoch) {
         match reader.read_line(&mut line) {
             Ok(0) => return Ok(()),
             Ok(_) => {
@@ -315,7 +438,7 @@ fn read_chat(channel: &str, gen: u64) -> std::io::Result<()> {
                     if line.starts_with("PING") {
                         stream.write_all(b"PONG :tmi.twitch.tv\r\n")?;
                     } else if let Some((user, text, color)) = parse_privmsg(&line) {
-                        push_message(&user, &text, color);
+                        push_message(p, &user, &text, color);
                     }
                     line.clear();
                 }
@@ -326,6 +449,497 @@ fn read_chat(channel: &str, gen: u64) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------- TikTok
+
+/// The HTTP and gzip the TikTok reader needs. In the game they come from
+/// `tiktok_net.rs` (ureq and flate2, which the game already has); tests get no network.
+#[cfg(test)]
+mod net {
+    pub struct Reply {
+        pub body: Vec<u8>,
+        pub set_cookies: Vec<String>,
+    }
+    pub fn request(_post_json: Option<&str>, _url: &str, _headers: &[(&str, &str)]) -> Result<Reply, String> {
+        Err("no network in tests".into())
+    }
+    pub fn gunzip(_data: &[u8]) -> Result<Vec<u8>, String> {
+        Err("no gzip in tests".into())
+    }
+}
+#[cfg(not(test))]
+use super::take_your_stream_chat_net as net;
+
+/// A TikTok live's chat is read through the web client's `webcast/im/fetch` endpoint and
+/// its protobuf, as the original mod's bootstrap and fallback polling do.
+pub mod tiktok {
+    use super::readable_text;
+
+    // ------------------------------------------------ protobuf wire format
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Val<'a> {
+        Varint(u64),
+        Bytes(&'a [u8]),
+        Fixed(u64),
+    }
+
+    /// The fields of one protobuf message, in order. Only what the chat needs is read.
+    #[derive(Clone, Debug, Default)]
+    pub struct Proto<'a> {
+        fields: Vec<(u32, Val<'a>)>,
+    }
+
+    fn varint(data: &[u8], pos: &mut usize) -> Result<u64, String> {
+        let mut value = 0u64;
+        for shift in (0..70).step_by(7) {
+            let byte = *data.get(*pos).ok_or("truncated varint")?;
+            *pos += 1;
+            if shift < 64 {
+                value |= u64::from(byte & 0x7F) << shift;
+            }
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err("varint too long".into())
+    }
+
+    impl<'a> Proto<'a> {
+        pub fn parse(data: &'a [u8]) -> Result<Proto<'a>, String> {
+            let mut fields = Vec::new();
+            let mut pos = 0;
+            while pos < data.len() {
+                let key = varint(data, &mut pos)?;
+                let field = (key >> 3) as u32;
+                let val = match key & 7 {
+                    0 => Val::Varint(varint(data, &mut pos)?),
+                    1 => {
+                        let b = data.get(pos..pos + 8).ok_or("truncated fixed64")?;
+                        pos += 8;
+                        Val::Fixed(u64::from_le_bytes(b.try_into().map_err(|_| "fixed64")?))
+                    }
+                    2 => {
+                        let len = varint(data, &mut pos)? as usize;
+                        let end = pos.checked_add(len).filter(|e| *e <= data.len());
+                        let end = end.ok_or("field longer than the message")?;
+                        let b = &data[pos..end];
+                        pos = end;
+                        Val::Bytes(b)
+                    }
+                    5 => {
+                        let b = data.get(pos..pos + 4).ok_or("truncated fixed32")?;
+                        pos += 4;
+                        Val::Fixed(u64::from(u32::from_le_bytes(b.try_into().map_err(|_| "fixed32")?)))
+                    }
+                    other => return Err(format!("unsupported wire type {other}")),
+                };
+                fields.push((field, val));
+            }
+            Ok(Proto { fields })
+        }
+
+        pub fn bytes(&self, field: u32) -> &'a [u8] {
+            self.fields
+                .iter()
+                .find_map(|(f, v)| match v {
+                    Val::Bytes(b) if *f == field => Some(*b),
+                    _ => None,
+                })
+                .unwrap_or(&[])
+        }
+
+        pub fn string(&self, field: u32) -> String {
+            String::from_utf8_lossy(self.bytes(field)).into_owned()
+        }
+
+        pub fn varint(&self, field: u32) -> u64 {
+            self.fields
+                .iter()
+                .find_map(|(f, v)| match v {
+                    Val::Varint(n) | Val::Fixed(n) if *f == field => Some(*n),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        }
+
+        /// A nested message, empty when the field is missing or is not one.
+        pub fn message(&self, field: u32) -> Proto<'a> {
+            Proto::parse(self.bytes(field)).unwrap_or_default()
+        }
+
+        pub fn messages(&self, field: u32) -> Vec<Proto<'a>> {
+            self.fields
+                .iter()
+                .filter_map(|(f, v)| match v {
+                    Val::Bytes(b) if *f == field => Proto::parse(b).ok(),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    // ------------------------------------------------ the fetch request
+
+    fn encode(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for b in s.bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out
+    }
+
+    /// `webcast/im/fetch` for `room_id`, from `cursor` on (empty the first time).
+    pub fn fetch_url(room_id: &str, cursor: &str, logged_in: bool) -> String {
+        let mut params: Vec<(&str, &str)> = vec![
+            ("aid", "1988"),
+            ("app_language", "en"),
+            ("app_name", "tiktok_web"),
+            ("browser_language", "en-US"),
+            ("browser_name", "Mozilla"),
+            ("browser_online", "true"),
+            ("browser_platform", "Win32"),
+            ("browser_version", "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
+            ("cookie_enabled", "true"),
+            ("cursor", cursor),
+            ("device_platform", "web"),
+            ("focus_state", "true"),
+            ("from_page", "user"),
+            ("history_comment_count", "36"),
+            ("is_fullscreen", "false"),
+            ("is_page_visible", "true"),
+            ("did_rule", "3"),
+            ("fetch_rule", "1"),
+            ("last_rtt", "0"),
+            ("live_id", "12"),
+            ("resp_content_type", "protobuf"),
+            ("room_id", room_id),
+            ("screen_height", "1080"),
+            ("screen_width", "1920"),
+            ("tz_name", "UTC"),
+            ("version_code", "180800"),
+            ("webcast_language", "en"),
+            ("identity", "audience"),
+        ];
+        if logged_in {
+            params.push(("user_is_login", "true"));
+        }
+        let query: Vec<String> = params
+            .iter()
+            .map(|(k, v)| format!("{}={}", encode(k), encode(v)))
+            .collect();
+        format!("https://webcast.tiktok.com/webcast/im/fetch/?{}", query.join("&"))
+    }
+
+    pub fn room_url(user: &str) -> String {
+        format!(
+            "https://www.tiktok.com/api-live/user/room/?aid=1988&sourceType=54&uniqueId={}",
+            encode(user)
+        )
+    }
+
+    /// The `Cookie` header: the `ttwid` and, when pasted, the player's session cookie (a
+    /// whole `name=value; ...` string, or a bare `sessionid`).
+    pub fn cookie_header(ttwid: &str, session: &str) -> String {
+        let mut parts = vec![format!("ttwid={ttwid}")];
+        let session = session.trim();
+        if !session.is_empty() {
+            if session.contains('=') {
+                parts.push(session.to_string());
+            } else {
+                parts.push(format!("sessionid={session}"));
+            }
+        }
+        parts.join("; ")
+    }
+
+    /// The `ttwid` of a response's `Set-Cookie` headers.
+    pub fn ttwid_from(set_cookies: &[String]) -> Option<String> {
+        set_cookies.iter().find_map(|c| {
+            let value = c.trim().strip_prefix("ttwid=")?;
+            let value = value.split(';').next()?.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        })
+    }
+
+    pub const TTWID_REGISTER_URL: &str = "https://www.tiktok.com/ttwid/union/register/";
+    pub const TTWID_REGISTER_BODY: &str = "{\"region\":\"us\",\"aid\":1988,\"needFid\":false,\"service\":\"www.tiktok.com\",\"migrate_info\":{\"ticket\":\"\",\"source\":\"node\"},\"cbUrlProtocol\":\"https\",\"union\":true}";
+
+    /// The live room of the room lookup's JSON (`data.user.roomId` and `status`; 2 is live).
+    pub fn parse_room(json: &str) -> Result<String, String> {
+        let status = json
+            .split_once("\"status\":")
+            .map(|(_, rest)| rest.trim_start().chars().take_while(char::is_ascii_digit).collect::<String>())
+            .and_then(|digits| digits.parse::<u32>().ok());
+        if let Some(status) = status {
+            if status != 2 {
+                return Err(format!("not live right now (status {status})"));
+            }
+        }
+        let room = json.split_once("\"roomId\":").map(|(_, rest)| {
+            rest.trim_start()
+                .trim_start_matches('"')
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        });
+        match room {
+            Some(id) if !id.is_empty() && id != "0" => Ok(id),
+            _ => Err("no live room found (user not found or not live)".into()),
+        }
+    }
+
+    // ------------------------------------------------ what comes back
+
+    /// Something that happened in the live.
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum Event {
+        Chat { id: u64, user: String, text: String },
+        Gift { id: u64, user: String, text: String },
+        LiveEnded,
+    }
+
+    /// One fetch's events, the cursor for the next and how long to wait before it.
+    #[derive(Debug, PartialEq)]
+    pub struct Fetched {
+        pub events: Vec<Event>,
+        pub cursor: String,
+        pub interval_ms: u64,
+    }
+
+    pub fn looks_like_html(body: &[u8]) -> bool {
+        let head: String = body.iter().take(64).map(|b| *b as char).collect();
+        let head = head.trim().to_ascii_lowercase();
+        head.starts_with("<!doctype") || head.starts_with("<html") || head.starts_with('{')
+    }
+
+    pub fn is_gzip(data: &[u8]) -> bool {
+        data.starts_with(&[0x1F, 0x8B])
+    }
+
+    /// Decodes a fetch response (already gunzipped). `cursor` is kept when it has none.
+    pub fn parse_fetch(body: &[u8], cursor: &str) -> Result<Fetched, String> {
+        let response = Proto::parse(body)?;
+        let next = response.string(2);
+        let interval = response.varint(3);
+        let events = response
+            .messages(1)
+            .iter()
+            .filter_map(parse_message)
+            .collect();
+        Ok(Fetched {
+            events,
+            cursor: if next.trim().is_empty() { cursor.to_string() } else { next },
+            interval_ms: if interval > 0 { interval.max(1500) } else { 2000 },
+        })
+    }
+
+    fn first_nonblank(values: &[String]) -> String {
+        values
+            .iter()
+            .find(|v| !v.trim().is_empty())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn user_name(message: &Proto, field: u32) -> String {
+        let user = message.message(field);
+        first_nonblank(&[user.string(3), user.string(38), "Viewer".to_string()])
+    }
+
+    /// The text of a chat message: its content field, or the newer nested ones.
+    fn chat_text(chat: &Proto) -> String {
+        for field in [3u32, 4, 22, 29, 30, 31] {
+            let direct = readable_text(&chat.string(field));
+            if !direct.is_empty() {
+                return direct;
+            }
+            let nested = chat.message(field);
+            for inner in [1u32, 2, 3] {
+                let text = readable_text(&nested.string(inner));
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+        }
+        String::new()
+    }
+
+    fn message_id(inner: &Proto, wrapper: u64) -> u64 {
+        match inner.message(1).varint(2) {
+            0 => wrapper,
+            id => id,
+        }
+    }
+
+    /// One `Message` of the response: its method name, payload and id.
+    pub fn parse_message(message: &Proto) -> Option<Event> {
+        let method = message.string(1);
+        let payload = message.bytes(2);
+        let wrapper = message.varint(3);
+        let inner = Proto::parse(payload).ok()?;
+        if method.ends_with("WebcastChatMessage") {
+            let text = chat_text(&inner);
+            if text.is_empty() {
+                return None;
+            }
+            Some(Event::Chat {
+                id: message_id(&inner, wrapper),
+                user: user_name(&inner, 2),
+                text,
+            })
+        } else if method.ends_with("WebcastGiftMessage") {
+            let details = inner.message(15);
+            // A gift streak sends a message per tap: only the finished one is shown.
+            if details.varint(11) == 1 && inner.varint(9) == 0 {
+                return None;
+            }
+            let name = readable_text(&details.string(16));
+            let count = inner.varint(5).max(1);
+            let what = match (name.is_empty(), count > 1) {
+                (true, true) => format!("x{count}"),
+                (true, false) => String::new(),
+                (false, true) => format!("{name} x{count}"),
+                (false, false) => name,
+            };
+            Some(Event::Gift {
+                id: message_id(&inner, wrapper),
+                user: user_name(&inner, 7),
+                text: if what.is_empty() { "sent a gift".into() } else { format!("sent {what}") },
+            })
+        } else if method.ends_with("WebcastControlMessage") && inner.varint(2) == 3 {
+            Some(Event::LiveEnded)
+        } else {
+            None
+        }
+    }
+}
+
+/// Text that is text: protobuf read as UTF-8 comes out full of replacement and control
+/// characters, which this drops (the original mod's `readableText`).
+pub fn readable_text(value: &str) -> String {
+    if value.trim().is_empty() {
+        return String::new();
+    }
+    let (mut total, mut printable, mut replacement) = (0usize, 0usize, 0usize);
+    for c in value.chars() {
+        total += 1;
+        if c == '\u{FFFD}' {
+            replacement += 1;
+        } else if !c.is_control() || matches!(c, '\n' | '\r' | '\t') {
+            printable += 1;
+        }
+    }
+    if replacement * 2 >= total || printable * 2 < total {
+        return String::new();
+    }
+    value.trim().to_string()
+}
+
+const TIKTOK_MAX_SEEN: usize = 5000;
+
+fn run_tiktok(user: &str, session: &str, epoch: u64) {
+    let p = Platform::TikTok;
+    while p.link().current(epoch) {
+        match read_tiktok(user, session, epoch) {
+            Ok(Ended::Stopped) => return,
+            Ok(Ended::LiveOver) => {
+                set_status(p, epoch, "The live ended");
+                return;
+            }
+            Err(e) => set_status(p, epoch, &format!("{e}, retrying...")),
+        }
+        if !pause(p, epoch, 10_000) {
+            return;
+        }
+    }
+}
+
+enum Ended {
+    Stopped,
+    LiveOver,
+}
+
+fn read_tiktok(user: &str, session: &str, epoch: u64) -> Result<Ended, String> {
+    use tiktok::Event;
+    let p = Platform::TikTok;
+    const REFERER: (&str, &str) = ("Referer", "https://www.tiktok.com/");
+
+    // Room, then the `ttwid` cookie the web client gets first.
+    let reply = net::request(None, &tiktok::room_url(user), &[REFERER])?;
+    let room = tiktok::parse_room(&String::from_utf8_lossy(&reply.body))?;
+    let ttwid = match net::request(None, "https://www.tiktok.com/", &[])
+        .ok()
+        .and_then(|r| tiktok::ttwid_from(&r.set_cookies))
+    {
+        Some(t) => t,
+        None => {
+            let reply = net::request(
+                Some(tiktok::TTWID_REGISTER_BODY),
+                tiktok::TTWID_REGISTER_URL,
+                &[REFERER],
+            )?;
+            tiktok::ttwid_from(&reply.set_cookies).ok_or("no ttwid cookie from TikTok")?
+        }
+    };
+    let cookie = tiktok::cookie_header(&ttwid, session);
+    set_status(p, epoch, &format!("Connected to @{user}"));
+
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut order: VecDeque<u64> = VecDeque::new();
+    let mut cursor = String::new();
+    let mut first = true;
+    loop {
+        if !p.link().current(epoch) {
+            return Ok(Ended::Stopped);
+        }
+        let url = tiktok::fetch_url(&room, &cursor, !session.trim().is_empty());
+        let reply = net::request(
+            None,
+            &url,
+            &[REFERER, ("Origin", "https://www.tiktok.com"), ("Cookie", &cookie)],
+        )?;
+        let mut body = reply.body;
+        if body.is_empty() || tiktok::looks_like_html(&body) {
+            return Err("TikTok answered with a page, not chat".into());
+        }
+        if tiktok::is_gzip(&body) {
+            body = net::gunzip(&body)?;
+        }
+        let fetched = tiktok::parse_fetch(&body, &cursor)?;
+        cursor = fetched.cursor;
+        for event in fetched.events {
+            let (id, user, text, color) = match event {
+                Event::LiveEnded => return Ok(Ended::LiveOver),
+                Event::Chat { id, user, text } => (id, user, text, None),
+                Event::Gift { id, user, text } => (id, user, text, Some(0xFF_FFD700)),
+            };
+            if id != 0 {
+                if !seen.insert(id) {
+                    continue;
+                }
+                order.push_back(id);
+                while order.len() > TIKTOK_MAX_SEEN {
+                    if let Some(old) = order.pop_front() {
+                        seen.remove(&old);
+                    }
+                }
+            }
+            // The first fetch is the chat's recent history: remembered, not shown.
+            if !first {
+                push_message(p, &user, &text, color.unwrap_or_else(|| default_color(&user)));
+            }
+        }
+        first = false;
+        if !pause(p, epoch, fetched.interval_ms) {
+            return Ok(Ended::Stopped);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- messages
@@ -341,18 +955,19 @@ pub fn passes(user: &str, text: &str, banwords: &[String], blocked: &[String]) -
 }
 
 /// Adds a message from the chat, unless it is filtered.
-pub fn push_message(user: &str, text: &str, color: u32) {
+pub fn push_message(platform: Platform, user: &str, text: &str, color: u32) {
     let mut s = state();
     if !passes(user, text, &s.banwords, &s.blocked) {
         return;
     }
-    add(&mut s, user, text, color);
+    add(&mut s, platform, user, text, color);
 }
 
-fn add(s: &mut State, user: &str, text: &str, color: u32) {
+fn add(s: &mut State, platform: Platform, user: &str, text: &str, color: u32) {
     s.seq += 1;
     let seq = s.seq;
     s.messages.push_back(ChatMessage {
+        platform,
         user: user.to_string(),
         text: text.to_string(),
         color,
@@ -412,7 +1027,7 @@ pub fn hud_entries() -> Vec<HudEntry> {
         .filter(|m| m.born.elapsed() < HUD_LIFETIME)
         .take(HUD_ENTRIES)
         .map(|m| HudEntry {
-            user: m.user.clone(),
+            user: format!("{}{}", m.platform.tag(), m.user),
             lines: wrap(&m.text, HUD_WRAP),
             color: m.color,
         })
@@ -491,7 +1106,11 @@ pub fn world_texts(eye: [f64; 3], yaw: f32) -> Vec<WorldText> {
         let rise = age.as_secs_f64() * 0.05;
         out.push(WorldText {
             at: [anchor[0], anchor[1] + rise, anchor[2]],
-            text: shorten(&m.user, &m.text, WORLD_MAX_CHARS),
+            text: shorten(
+                &format!("{}{}", m.platform.tag(), m.user),
+                &m.text,
+                WORLD_MAX_CHARS,
+            ),
             color: (world_alpha(age) << 24) | (m.color & 0x00FF_FFFF),
         });
     }
@@ -500,8 +1119,7 @@ pub fn world_texts(eye: [f64; 3], yaw: f32) -> Vec<WorldText> {
 
 // ---------------------------------------------------------------- commands
 
-/// What a `/streamchat` command did: lines for the chat box, settings to keep, and
-/// whether the connection should be (re)started or stopped.
+/// What a `/streamchat` command did: lines for the chat box and settings to keep.
 #[derive(Debug, Default, PartialEq)]
 pub struct Outcome {
     pub lines: Vec<String>,
@@ -510,9 +1128,11 @@ pub struct Outcome {
 
 pub fn help() -> Vec<String> {
     [
-        "Take Your Stream Chat (Twitch)",
-        "/streamchat channel <name>: the channel to read",
-        "/streamchat chat start | stop: connect or disconnect",
+        "Take Your Stream Chat (Twitch, TikTok)",
+        "/streamchat channel <name>: the Twitch channel to read",
+        "/streamchat tiktok <@name>: the TikTok live to read",
+        "/streamchat tiktok session <cookie> | clear: optional TikTok login cookie",
+        "/streamchat chat start | stop [twitch|tiktok]: connect or disconnect",
         "/streamchat mode hud | world | both: where messages show",
         "/streamchat test <text>: a test message",
         "/streamchat banword <word> | blockuser <name>: add or remove from the filters",
@@ -534,6 +1154,33 @@ fn toggle(list: &mut Vec<String>, item: &str) -> bool {
     }
 }
 
+fn chat_start(which: &str, out: &mut Outcome) {
+    let platforms: Vec<Platform> = match Platform::parse(which) {
+        Some(p) => vec![p],
+        None if which.is_empty() => Platform::ALL.to_vec(),
+        None => {
+            out.lines.push("Usage: /streamchat chat start [twitch|tiktok]".into());
+            return;
+        }
+    };
+    let mut started = false;
+    for p in platforms {
+        let name = target(p);
+        if connect(p) {
+            started = true;
+            out.lines.push(format!("Connecting to {} {name}...", p.name()));
+        } else if which.is_empty() {
+            // Both asked for and this one isn't set up: not an error.
+        } else {
+            out.lines.push(format!("Set the {} name first (see /streamchat)", p.name()));
+        }
+    }
+    if !started && which.is_empty() {
+        out.lines
+            .push("Set a channel first: /streamchat channel <name> or /streamchat tiktok <@name>".into());
+    }
+}
+
 /// Runs the arguments of `/streamchat` (or `/minestream`).
 pub fn run_command(args: &str) -> Outcome {
     let mut out = Outcome::default();
@@ -545,8 +1192,8 @@ pub fn run_command(args: &str) -> Outcome {
             Some(name) => {
                 state().channel = name.clone();
                 out.save.push(("channel", name.clone()));
-                if is_connected() {
-                    connect(&name);
+                if is_connected(Platform::Twitch) {
+                    connect(Platform::Twitch);
                     out.lines.push(format!("Switching to #{name}"));
                 } else {
                     out.lines
@@ -557,23 +1204,66 @@ pub fn run_command(args: &str) -> Outcome {
                 .lines
                 .push("Usage: /streamchat channel <twitch name>".into()),
         },
-        "chat" => match rest.to_ascii_lowercase().as_str() {
-            "start" => {
-                let channel = channel();
-                if channel.is_empty() {
-                    out.lines
-                        .push("Set a channel first: /streamchat channel <name>".into());
-                } else {
-                    connect(&channel);
-                    out.lines.push(format!("Connecting to #{channel}..."));
+        "tiktok" => {
+            let (what, value) = rest.split_once(' ').unwrap_or((rest, ""));
+            match what.to_ascii_lowercase().as_str() {
+                "session" => {
+                    let cookie = if value.trim().eq_ignore_ascii_case("clear") {
+                        String::new()
+                    } else {
+                        clean_cookie(value)
+                    };
+                    state().tiktok_session = cookie.clone();
+                    let set = !cookie.is_empty();
+                    out.save.push(("tiktok_session", cookie));
+                    out.lines.push(if set {
+                        "TikTok session saved (used at the next connection)".into()
+                    } else {
+                        "TikTok session cleared".into()
+                    });
                 }
+                _ => match clean_tiktok_user(rest) {
+                    Some(name) => {
+                        state().tiktok_user = name.clone();
+                        out.save.push(("tiktok_user", name.clone()));
+                        if is_connected(Platform::TikTok) {
+                            connect(Platform::TikTok);
+                            out.lines.push(format!("Switching to @{name}"));
+                        } else {
+                            out.lines.push(format!(
+                                "TikTok set to @{name}. /streamchat chat start tiktok"
+                            ));
+                        }
+                    }
+                    None => out
+                        .lines
+                        .push("Usage: /streamchat tiktok <@name> | session <cookie>".into()),
+                },
             }
-            "stop" => {
-                disconnect();
-                out.lines.push("Chat disconnected".into());
+        }
+        "chat" => {
+            let (action, which) = rest.split_once(' ').unwrap_or((rest, ""));
+            let which = which.trim();
+            match action.to_ascii_lowercase().as_str() {
+                "start" => chat_start(which, &mut out),
+                "stop" => match (which.is_empty(), Platform::parse(which)) {
+                    (true, _) => {
+                        Platform::ALL.iter().for_each(|p| disconnect(*p));
+                        out.lines.push("Chat disconnected".into());
+                    }
+                    (false, Some(p)) => {
+                        disconnect(p);
+                        out.lines.push(format!("{} disconnected", p.name()));
+                    }
+                    (false, None) => out
+                        .lines
+                        .push("Usage: /streamchat chat stop [twitch|tiktok]".into()),
+                },
+                _ => out
+                    .lines
+                    .push("Usage: /streamchat chat start | stop [twitch|tiktok]".into()),
             }
-            _ => out.lines.push("Usage: /streamchat chat start | stop".into()),
-        },
+        }
         "mode" => match Mode::parse(rest) {
             Some(mode) => {
                 state().mode = mode;
@@ -586,7 +1276,7 @@ pub fn run_command(args: &str) -> Outcome {
         },
         "test" if !rest.is_empty() => {
             let mut s = state();
-            add(&mut s, "Test", rest, 0xFF_FFAA00);
+            add(&mut s, Platform::Twitch, "Test", rest, 0xFF_FFAA00);
         }
         "banword" | "blockuser" if !rest.is_empty() => {
             let word = sub.eq_ignore_ascii_case("banword");
@@ -611,17 +1301,20 @@ pub fn run_command(args: &str) -> Outcome {
         }
         "status" => {
             let s = state();
-            let channel = if s.channel.is_empty() {
-                "none".to_string()
-            } else {
-                format!("#{}", s.channel)
-            };
-            let line = format!(
-                "Channel: {channel}, mode: {}, {}",
-                s.mode.name(),
-                if s.status.is_empty() { "not connected" } else { &s.status }
-            );
-            out.lines.push(line);
+            out.lines.push(format!("Mode: {}", s.mode.name()));
+            for p in Platform::ALL {
+                let name = match p {
+                    Platform::Twitch if !s.channel.is_empty() => format!("#{}", s.channel),
+                    Platform::TikTok if !s.tiktok_user.is_empty() => format!("@{}", s.tiktok_user),
+                    _ => "not set".to_string(),
+                };
+                let status = &s.status[p.index()];
+                out.lines.push(format!(
+                    "{}: {name}, {}",
+                    p.name(),
+                    if status.is_empty() { "not connected" } else { status }
+                ));
+            }
         }
         _ => out.lines = help(),
     }
@@ -630,10 +1323,11 @@ pub fn run_command(args: &str) -> Outcome {
 
 // ---------------------------------------------------------------- settings page
 
-pub fn connection_label() -> String {
+pub fn connection_label(p: Platform) -> String {
     format!(
-        "Chat: {}",
-        if is_connected() { "ON" } else { "OFF" }
+        "{}: {}",
+        p.name(),
+        if is_connected(p) { "ON" } else { "OFF" }
     )
 }
 
@@ -641,30 +1335,28 @@ pub fn mode_label() -> String {
     format!("Show: {}", mode().name())
 }
 
-pub fn channel_label() -> String {
-    let c = channel();
-    if c.is_empty() {
-        "Channel: none (/streamchat channel <name>)".into()
-    } else {
-        format!("Channel: #{c}")
-    }
+pub fn names_label() -> String {
+    let (c, t) = (channel(), tiktok_user());
+    format!(
+        "Twitch {}, TikTok {} (/streamchat channel, tiktok)",
+        if c.is_empty() { "none".to_string() } else { format!("#{c}") },
+        if t.is_empty() { "none".to_string() } else { format!("@{t}") },
+    )
 }
 
 /// A click on a settings button. Returns the setting to keep, if any.
 pub fn click(button: usize) -> Option<(&'static str, String)> {
     match button {
-        0 => {
-            if is_connected() {
-                disconnect();
+        0 | 1 => {
+            let p = Platform::ALL[button];
+            if is_connected(p) {
+                disconnect(p);
             } else {
-                let c = channel();
-                if !c.is_empty() {
-                    connect(&c);
-                }
+                connect(p);
             }
             None
         }
-        1 => {
+        2 => {
             let mode = {
                 let mut s = state();
                 s.mode = s.mode.next();
@@ -755,5 +1447,137 @@ mod tests {
         assert_eq!(Mode::parse("3D"), Some(Mode::World));
         assert_eq!(Mode::Hud.next().next().next(), Mode::Hud);
         assert!(Mode::Both.hud() && Mode::Both.world());
+    }
+
+    // ---- TikTok
+
+    fn varint_bytes(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let b = (v & 0x7F) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                return out;
+            }
+            out.push(b | 0x80);
+        }
+    }
+    fn field_varint(f: u32, v: u64) -> Vec<u8> {
+        let mut out = varint_bytes(u64::from(f) << 3);
+        out.extend(varint_bytes(v));
+        out
+    }
+    fn field_bytes(f: u32, b: &[u8]) -> Vec<u8> {
+        let mut out = varint_bytes(u64::from(f) << 3 | 2);
+        out.extend(varint_bytes(b.len() as u64));
+        out.extend_from_slice(b);
+        out
+    }
+    /// A `Message` of the response: method, payload and wrapper id.
+    fn wrapper(method: &str, payload: &[u8], id: u64) -> Vec<u8> {
+        let mut m = field_bytes(1, method.as_bytes());
+        m.extend(field_bytes(2, payload));
+        m.extend(field_varint(3, id));
+        m
+    }
+    fn chat_payload(text: &str, nick: &str, id: u64) -> Vec<u8> {
+        let mut p = field_bytes(1, &field_varint(2, id));
+        p.extend(field_bytes(2, &field_bytes(3, nick.as_bytes())));
+        p.extend(field_bytes(3, text.as_bytes()));
+        p
+    }
+
+    #[test]
+    fn protobuf_fields_read_back() {
+        let mut data = field_varint(1, 300);
+        data.extend(field_bytes(2, b"hi"));
+        data.extend(field_bytes(3, &field_varint(1, 7)));
+        let p = tiktok::Proto::parse(&data).unwrap();
+        assert_eq!(p.varint(1), 300);
+        assert_eq!(p.string(2), "hi");
+        assert_eq!(p.message(3).varint(1), 7);
+        assert_eq!(p.varint(9), 0);
+        assert!(tiktok::Proto::parse(&[0x0A, 0x05, 1]).is_err());
+    }
+
+    #[test]
+    fn a_fetch_response_gives_chat_and_gifts() {
+        let gift_user = field_bytes(7, &field_bytes(3, b"Fan"));
+        let mut gift = field_bytes(15, &field_bytes(16, b"Rose"));
+        gift.extend(field_varint(5, 3));
+        gift.extend(gift_user);
+        let mut body = field_bytes(
+            1,
+            &wrapper("WebcastChatMessage", &chat_payload("hello tiktok", "Ann", 42), 1),
+        );
+        body.extend(field_bytes(1, &wrapper("WebcastGiftMessage", &gift, 2)));
+        body.extend(field_bytes(1, &wrapper("WebcastMemberMessage", b"", 3)));
+        body.extend(field_bytes(2, b"cursor-1"));
+        body.extend(field_varint(3, 1000));
+        let f = tiktok::parse_fetch(&body, "old").unwrap();
+        assert_eq!(f.cursor, "cursor-1");
+        assert_eq!(f.interval_ms, 1500);
+        assert_eq!(
+            f.events,
+            vec![
+                tiktok::Event::Chat { id: 42, user: "Ann".into(), text: "hello tiktok".into() },
+                tiktok::Event::Gift { id: 2, user: "Fan".into(), text: "sent Rose x3".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_cursor_is_kept_and_the_live_can_end() {
+        let control = field_bytes(1, &wrapper("WebcastControlMessage", &field_varint(2, 3), 9));
+        let f = tiktok::parse_fetch(&control, "keep").unwrap();
+        assert_eq!(f.cursor, "keep");
+        assert_eq!(f.interval_ms, 2000);
+        assert_eq!(f.events, vec![tiktok::Event::LiveEnded]);
+    }
+
+    #[test]
+    fn rooms_come_from_the_lookup_json() {
+        let live = r#"{"data":{"user":{"roomId":"7123456789","status":2}}}"#;
+        assert_eq!(tiktok::parse_room(live).unwrap(), "7123456789");
+        let off = r#"{"data":{"user":{"roomId":"0","status":4}}}"#;
+        assert!(tiktok::parse_room(off).unwrap_err().contains("not live"));
+        assert!(tiktok::parse_room("{}").is_err());
+    }
+
+    #[test]
+    fn the_ttwid_and_cookie_header() {
+        let cookies = vec!["foo=1".to_string(), "ttwid=abc%7Cdef; Domain=.tiktok.com".to_string()];
+        assert_eq!(tiktok::ttwid_from(&cookies), Some("abc%7Cdef".into()));
+        assert_eq!(tiktok::cookie_header("t", ""), "ttwid=t");
+        assert_eq!(tiktok::cookie_header("t", "tok"), "ttwid=t; sessionid=tok");
+        assert_eq!(tiktok::cookie_header("t", "a=1; b=2"), "ttwid=t; a=1; b=2");
+    }
+
+    #[test]
+    fn the_fetch_url_is_encoded() {
+        let url = tiktok::fetch_url("123", "cur sor", false);
+        assert!(url.starts_with("https://webcast.tiktok.com/webcast/im/fetch/?aid=1988"));
+        assert!(url.contains("room_id=123") && url.contains("cursor=cur%20sor"));
+        assert!(!url.contains("user_is_login"));
+        assert!(tiktok::fetch_url("1", "", true).contains("user_is_login=true"));
+    }
+
+    #[test]
+    fn pages_and_garbage_are_told_apart_from_chat() {
+        assert!(tiktok::looks_like_html(b"<!DOCTYPE html>"));
+        assert!(tiktok::looks_like_html(b"  {\"error\":1}"));
+        assert!(!tiktok::looks_like_html(&[0x0A, 0x02, 0x08, 0x01]));
+        assert!(tiktok::is_gzip(&[0x1F, 0x8B, 8]));
+        assert_eq!(readable_text("  hi \u{1F602} "), "hi \u{1F602}");
+        assert_eq!(readable_text("\u{FFFD}\u{FFFD}a"), "");
+        assert_eq!(readable_text("\u{1}\u{2}\u{3}"), "");
+    }
+
+    #[test]
+    fn tiktok_names_are_cleaned() {
+        assert_eq!(clean_tiktok_user(" @Some.User_1 "), Some("some.user_1".into()));
+        assert_eq!(clean_tiktok_user("bad name"), None);
+        assert_eq!(clean_cookie(" a=1\r\n; b=2 "), "a=1; b=2");
     }
 }
